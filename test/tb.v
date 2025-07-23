@@ -49,7 +49,7 @@ module tb ();
     #100;
     
     $display("Test complete");
-    $finish;
+  //  $finish;
   end
   
 endmodule
