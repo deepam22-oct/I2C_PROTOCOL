@@ -26,31 +26,30 @@ module tt_um_example (
     wire [7:0] data_out;
     wire ready;
     
-    // I2C signals - using bidirectional IOs
-    wire i2c_sda, i2c_scl;
+    // I2C signals
+    wire sda_out, sda_in, sda_oe;
+    wire scl_out, scl_in, scl_oe;
     
     // Input mapping
     assign addr = ui_in[6:0];        // 7-bit I2C address from ui_in[6:0]
     assign enable = ui_in[7];        // Enable signal from ui_in[7]
-    assign data_in = uio_in;         // 8-bit data input from uio_in
-    assign rw = uio_in[7];           // Read/Write bit from uio_in[7] (can also be from ui_in if preferred)
+    assign data_in = uio_in[7:0];    // 8-bit data input from uio_in
+    assign rw = uio_in[7];           // Read/Write bit from uio_in[7]
     
     // Output mapping
     assign uo_out = data_out;        // I2C read data output
     
     // Bidirectional IO configuration
-    // uio[0] = SDA, uio[1] = SCL
-    assign uio_oe[1:0] = 2'b11;      // Enable SDA and SCL as outputs (they'll be tri-stated internally)
+    assign uio_oe[0] = sda_oe;       // SDA output enable
+    assign uio_oe[1] = scl_oe;       // SCL output enable
     assign uio_oe[7:2] = 6'b000000;  // Other uio pins as inputs
-    assign uio_out[7:2] = 6'b000000; // Unused outputs set to 0
-    assign uio_out[1] = ready;       // Ready signal on uio_out[1] 
-    assign uio_out[0] = 1'b0;        // uio_out[0] controlled by I2C
     
-    // I2C signal connections to bidirectional pins
-    // Note: For TinyTapeout, we need to be careful about bidirectional signals
-    // The actual I2C lines will be external, but we'll connect through the IO pins
-    assign i2c_sda = 1'bz;  // This will be controlled by the I2C modules
-    assign i2c_scl = 1'bz;  // This will be controlled by the I2C modules
+    assign uio_out[0] = sda_out;     // SDA output
+    assign uio_out[1] = scl_out;     // SCL output  
+    assign uio_out[7:2] = {5'b00000, ready}; // Ready signal on uio_out[7]
+    
+    assign sda_in = uio_in[0];       // SDA input
+    assign scl_in = uio_in[1];       // SCL input
     
     // Instantiate the I2C top module
     i2c_top i2c_system (
@@ -62,16 +61,18 @@ module tt_um_example (
         .rw(rw),
         .data_out(data_out),
         .ready(ready),
-        .i2c_sda(i2c_sda),
-        .i2c_scl(i2c_scl)
+        .sda_in(sda_in),
+        .sda_out(sda_out),
+        .sda_oe(sda_oe),
+        .scl_in(scl_in),
+        .scl_out(scl_out),
+        .scl_oe(scl_oe)
     );
 
     // List all unused inputs to prevent warnings
     wire _unused = &{ena, 1'b0};
 
 endmodule
-
-// Your I2C modules below (unchanged)
 
 module i2c_top(
     input wire clk,
@@ -84,307 +85,380 @@ module i2c_top(
     output wire [7:0] data_out,
     output wire ready,
 
-    inout wire i2c_sda,
-    inout wire i2c_scl);
+    input wire sda_in,
+    output wire sda_out,
+    output wire sda_oe,
+    input wire scl_in,
+    output wire scl_out,
+    output wire scl_oe
+);
    
+    // Internal I2C bus signals
+    wire i2c_sda_master, i2c_scl_master;
+    wire i2c_sda_slave, i2c_scl_slave;
+    wire master_sda_oe, master_scl_oe;
+    wire slave_sda_oe, slave_scl_oe;
+    
+    // Bus arbitration (simplified - master has priority)
+    assign sda_out = master_sda_oe ? i2c_sda_master : (slave_sda_oe ? i2c_sda_slave : 1'b1);
+    assign scl_out = master_scl_oe ? i2c_scl_master : 1'b1;
+    assign sda_oe = master_sda_oe | slave_sda_oe;
+    assign scl_oe = master_scl_oe;
    
-  i2c_controller master (
-            .clk(clk), 
-            .rst(rst), 
-            .addr(addr), 
-            .data_in(data_in), 
-            .enable(enable), 
-            .rw(rw), 
-            .data_out(data_out), 
-            .ready(ready), 
-            .i2c_sda(i2c_sda), 
-            .i2c_scl(i2c_scl)
-        );
-  i2c_slave_controller #(7'b0101010) slave1 (
-            .sda(i2c_sda),
-            .scl(i2c_scl)
-        );
+    i2c_controller master (
+        .clk(clk), 
+        .rst(rst), 
+        .addr(addr), 
+        .data_in(data_in), 
+        .enable(enable), 
+        .rw(rw), 
+        .data_out(data_out), 
+        .ready(ready), 
+        .sda_in(sda_in),
+        .sda_out(i2c_sda_master),
+        .sda_oe(master_sda_oe),
+        .scl_in(scl_in),
+        .scl_out(i2c_scl_master),
+        .scl_oe(master_scl_oe)
+    );
+    
+    i2c_slave_controller #(7'b0101010) slave1 (
+        .clk(clk),
+        .rst(rst),
+        .sda_in(sda_in),
+        .sda_out(i2c_sda_slave),
+        .sda_oe(slave_sda_oe),
+        .scl_in(scl_in)
+    );
 endmodule
 
-// Master 
-
+// Master Controller
 module i2c_controller(
-        input wire clk,
-        input wire rst,
-        input wire [6:0] addr,
-        input wire [7:0] data_in,
-        input wire enable,
-        input wire rw,
+    input wire clk,
+    input wire rst,
+    input wire [6:0] addr,
+    input wire [7:0] data_in,
+    input wire enable,
+    input wire rw,
 
-        output reg [7:0] data_out,
-        output wire ready,
+    output reg [7:0] data_out,
+    output wire ready,
 
-        inout i2c_sda,
-        inout wire i2c_scl
-        );
-
-        localparam IDLE = 0;
-        localparam START = 1;
-        localparam ADDRESS = 2;
-        localparam READ_ACK = 3;
-        localparam WRITE_DATA = 4;
-        localparam WRITE_ACK = 5;
-        localparam READ_DATA = 6;
-        localparam READ_ACK2 = 7;
-        localparam STOP = 8;
-        
-        localparam DIVIDE_BY = 4;
-
-        reg [7:0] state;
-        reg [7:0] saved_addr;
-        reg [7:0] saved_data;
-        reg [7:0] counter;
-        reg [7:0] counter2 = 0;
-        reg write_enable;
-        reg sda_out;
-        reg i2c_scl_enable = 0;
-        reg i2c_clk = 1;
-
-        assign ready = ((rst == 0) && (state == IDLE)) ? 1 : 0;
-        assign i2c_scl = (i2c_scl_enable == 0 ) ? 1 : i2c_clk;
-        assign i2c_sda = (write_enable == 1) ? sda_out : 'bz;
-        
-        always @(posedge clk) begin
-                if (counter2 == (DIVIDE_BY/2) - 1) begin
-                        i2c_clk <= ~i2c_clk;
-                        counter2 <= 0;
-                end
-                else counter2 <= counter2 + 1;
-        end 
-        
-        always @(negedge i2c_clk, posedge rst) begin
-                if(rst == 1) begin
-                        i2c_scl_enable <= 0;
-                end else begin
-                        if ((state == IDLE) || (state == START) || (state == STOP)) begin
-                                i2c_scl_enable <= 0;
-                        end else begin
-                                i2c_scl_enable <= 1;
-                        end
-                end
-        
-        end
-
-
-        always @(posedge i2c_clk, posedge rst) begin
-                if(rst == 1) begin
-                        state <= IDLE;
-                end                
-                else begin
-                        case(state)
-                        
-                                IDLE: begin
-                                        if (enable) begin
-                                                state <= START;
-                                                saved_addr <= {addr, rw};
-                                                saved_data <= data_in;
-                                        end
-                                        else state <= IDLE;
-                                end
-
-                                START: begin
-                                        counter <= 7;
-                                        state <= ADDRESS;
-                                end
-
-                                ADDRESS: begin
-                                        if (counter == 0) begin 
-                                                state <= READ_ACK;
-                                        end else counter <= counter - 1;
-                                end
-
-                                READ_ACK: begin
-                                        if (i2c_sda == 0) begin
-                                                counter <= 7;
-                                                if(saved_addr[0] == 0) state <= WRITE_DATA;
-                                                else state <= READ_DATA;
-                                        end else state <= STOP;
-                                end
-
-                                WRITE_DATA: begin
-                                        if(counter == 0) begin
-                                                state <= READ_ACK2;
-                                        end else counter <= counter - 1;
-                                end
-                                
-                                READ_ACK2: begin
-                                        if ((i2c_sda == 0) && (enable == 1)) state <= IDLE;
-                                        else state <= STOP;
-                                end
-
-                                READ_DATA: begin
-                                        data_out[counter] <= i2c_sda;
-                                        if (counter == 0) state <= WRITE_ACK;
-                                        else counter <= counter - 1;
-                                end
-                                
-                                WRITE_ACK: begin
-                                        state <= STOP;
-                                end
-
-                                STOP: begin
-                                        state <= IDLE;
-                                end
-                        endcase
-                end
-        end
-        
-        always @(negedge i2c_clk, posedge rst) begin
-                if(rst == 1) begin
-                        write_enable <= 1;
-                        sda_out <= 1;
-                end else begin
-                        case(state)
-                                
-                                START: begin
-                                        write_enable <= 1;
-                                        sda_out <= 0;
-                                end
-                                
-                                ADDRESS: begin
-                                        sda_out <= saved_addr[counter];
-                                end
-                                
-                                READ_ACK: begin
-                                        write_enable <= 0;
-                                end
-                                
-                                WRITE_DATA: begin 
-                                        write_enable <= 1;
-                                        sda_out <= saved_data[counter];
-                                end
-                                
-                                WRITE_ACK: begin
-                                        write_enable <= 1;
-                                        sda_out <= 0;
-                                end
-                                
-                                READ_DATA: begin
-                                        write_enable <= 0;                                
-                                end
-                                
-                                STOP: begin
-                                        write_enable <= 1;
-                                        sda_out <= 1;
-                                end
-                        endcase
-                end
-        end
-
-endmodule
-
-// SLAVE 
-
-module i2c_slave_controller #(parameter ADDRESS = 7'b0101010)(
-    inout wire sda,
-    inout wire scl
+    input wire sda_in,
+    output reg sda_out,
+    output reg sda_oe,
+    input wire scl_in,
+    output reg scl_out,
+    output reg scl_oe
 );
 
-        
-        // localparam ADDRESS = 7'b0101010;
-        
-        localparam READ_ADDR = 0;
-        localparam SEND_ACK = 1;
-        localparam READ_DATA = 2;
-        localparam WRITE_DATA = 3;
-        localparam SEND_ACK2 = 4;
-        
-        reg [7:0] addr;
-        reg [7:0] counter;
-        reg [7:0] state = 0;
-        reg [7:0] data_in = 0;
-        reg [7:0] data_out = 8'b11001100;
-        reg sda_out = 0;
-        reg sda_in = 0;
-        reg start = 0;
-        reg write_enable = 0;
-        
-        assign sda = (write_enable == 1) ? sda_out : 'bz;
-        
-        always @(negedge sda) begin
-                if ((start == 0) && (scl == 1)) begin
-                        start <= 1;        
-                        counter <= 7;
-                end
+    localparam IDLE = 0;
+    localparam START = 1;
+    localparam ADDRESS = 2;
+    localparam READ_ACK = 3;
+    localparam WRITE_DATA = 4;
+    localparam WRITE_ACK = 5;
+    localparam READ_DATA = 6;
+    localparam READ_ACK2 = 7;
+    localparam STOP = 8;
+    
+    localparam DIVIDE_BY = 4;
+
+    reg [7:0] state;
+    reg [7:0] saved_addr;
+    reg [7:0] saved_data;
+    reg [7:0] counter;
+    reg [7:0] counter2;
+    reg i2c_clk;
+
+    assign ready = ((rst == 0) && (state == IDLE)) ? 1 : 0;
+    
+    // Clock generation
+    always @(posedge clk) begin
+        if (rst) begin
+            counter2 <= 0;
+            i2c_clk <= 1;
+        end else begin
+            if (counter2 == (DIVIDE_BY/2) - 1) begin
+                i2c_clk <= ~i2c_clk;
+                counter2 <= 0;
+            end else begin
+                counter2 <= counter2 + 1;
+            end
         end
-        
-        always @(posedge sda) begin
-                if ((start == 1) && (scl == 1)) begin
-                        state <= READ_ADDR;
-                        start <= 0;
-                        write_enable <= 0;
+    end 
+    
+    // Main state machine
+    always @(posedge clk) begin
+        if (rst) begin
+            state <= IDLE;
+            sda_out <= 1;
+            sda_oe <= 1;
+            scl_out <= 1;
+            scl_oe <= 0;
+            counter <= 0;
+            saved_addr <= 0;
+            saved_data <= 0;
+            data_out <= 0;
+        end else begin
+            case(state)
+                IDLE: begin
+                    sda_out <= 1;
+                    sda_oe <= 1;
+                    scl_out <= 1;
+                    scl_oe <= 0;
+                    if (enable) begin
+                        state <= START;
+                        saved_addr <= {addr, rw};
+                        saved_data <= data_in;
+                    end
                 end
-        end
-        
-        always @(posedge scl) begin
-                if (start == 1) begin
-                        case(state)
-                                READ_ADDR: begin
-                                        addr[counter] <= sda;
-                                        if(counter == 0) state <= SEND_ACK;
-                                        else counter <= counter - 1;                                        
-                                end
-                                
-                                SEND_ACK: begin
-                                        if(addr[7:1] == ADDRESS) begin
-                                                counter <= 7;
-                                                if(addr[0] == 0) begin 
-                                                        state <= READ_DATA;
-                                                end
-                                                else state <= WRITE_DATA;
-                                        end
-                                end
-                                
-                                READ_DATA: begin
-                                        data_in[counter] <= sda;
-                                        if(counter == 0) begin
-                                                state <= SEND_ACK2;
-                                        end else counter <= counter - 1;
-                                end
-                                
-                                SEND_ACK2: begin
-                                        state <= READ_ADDR;                                        
-                                end
-                                
-                                WRITE_DATA: begin
-                                        if(counter == 0) state <= READ_ADDR;
-                                        else counter <= counter - 1;                
-                                end
-                                
-                        endcase
+
+                START: begin
+                    sda_out <= 0;  // START condition
+                    sda_oe <= 1;
+                    scl_out <= 1;
+                    scl_oe <= 1;
+                    counter <= 7;
+                    state <= ADDRESS;
                 end
+
+                ADDRESS: begin
+                    scl_out <= i2c_clk;
+                    scl_oe <= 1;
+                    sda_out <= saved_addr[counter];
+                    sda_oe <= 1;
+                    if (i2c_clk == 0) begin  // Update on falling edge
+                        if (counter == 0) begin 
+                            state <= READ_ACK;
+                        end else begin
+                            counter <= counter - 1;
+                        end
+                    end
+                end
+
+                READ_ACK: begin
+                    scl_out <= i2c_clk;
+                    scl_oe <= 1;
+                    sda_oe <= 0;  // Release SDA for ACK
+                    if (i2c_clk == 1) begin  // Sample on rising edge
+                        if (sda_in == 0) begin
+                            counter <= 7;
+                            if(saved_addr[0] == 0) begin
+                                state <= WRITE_DATA;
+                            end else begin
+                                state <= READ_DATA;
+                            end
+                        end else begin
+                            state <= STOP;
+                        end
+                    end
+                end
+
+                WRITE_DATA: begin
+                    scl_out <= i2c_clk;
+                    scl_oe <= 1;
+                    sda_out <= saved_data[counter];
+                    sda_oe <= 1;
+                    if (i2c_clk == 0) begin
+                        if(counter == 0) begin
+                            state <= READ_ACK2;
+                        end else begin
+                            counter <= counter - 1;
+                        end
+                    end
+                end
+                
+                READ_ACK2: begin
+                    scl_out <= i2c_clk;
+                    scl_oe <= 1;
+                    sda_oe <= 0;
+                    if (i2c_clk == 1) begin
+                        if ((sda_in == 0) && (enable == 1)) begin
+                            state <= IDLE;
+                        end else begin
+                            state <= STOP;
+                        end
+                    end
+                end
+
+                READ_DATA: begin
+                    scl_out <= i2c_clk;
+                    scl_oe <= 1;
+                    sda_oe <= 0;
+                    if (i2c_clk == 1) begin  // Sample on rising edge
+                        data_out[counter] <= sda_in;
+                        if (counter == 0) begin
+                            state <= WRITE_ACK;
+                        end else begin
+                            counter <= counter - 1;
+                        end
+                    end
+                end
+                
+                WRITE_ACK: begin
+                    scl_out <= i2c_clk;
+                    scl_oe <= 1;
+                    sda_out <= 0;  // Send ACK
+                    sda_oe <= 1;
+                    if (i2c_clk == 0) begin
+                        state <= STOP;
+                    end
+                end
+
+                STOP: begin
+                    scl_out <= 1;
+                    scl_oe <= 1;
+                    sda_out <= 1;  // STOP condition
+                    sda_oe <= 1;
+                    state <= IDLE;
+                end
+                
+                default: begin
+                    state <= IDLE;
+                end
+            endcase
         end
+    end
+
+endmodule
+
+// Slave Controller
+module i2c_slave_controller #(parameter ADDRESS = 7'b0101010)(
+    input wire clk,
+    input wire rst,
+    input wire sda_in,
+    output reg sda_out,
+    output reg sda_oe,
+    input wire scl_in
+);
         
-        always @(negedge scl) begin
+    localparam READ_ADDR = 0;
+    localparam SEND_ACK = 1;
+    localparam READ_DATA = 2;
+    localparam WRITE_DATA = 3;
+    localparam SEND_ACK2 = 4;
+    
+    reg [7:0] addr;
+    reg [7:0] counter;
+    reg [7:0] state;
+    reg [7:0] data_in;
+    reg [7:0] data_out;
+    reg start;
+    reg scl_prev;
+    reg sda_prev;
+    
+    always @(posedge clk) begin
+        if (rst) begin
+            addr <= 0;
+            counter <= 0;
+            state <= READ_ADDR;
+            data_in <= 0;
+            data_out <= 8'b11001100;
+            sda_out <= 0;
+            sda_oe <= 0;
+            start <= 0;
+            scl_prev <= 1;
+            sda_prev <= 1;
+        end else begin
+            scl_prev <= scl_in;
+            sda_prev <= sda_in;
+            
+            // Detect START condition
+            if ((sda_prev == 1) && (sda_in == 0) && (scl_in == 1) && (start == 0)) begin
+                start <= 1;        
+                counter <= 7;
+                state <= READ_ADDR;
+                sda_oe <= 0;
+            end
+            
+            // Detect STOP condition
+            if ((sda_prev == 0) && (sda_in == 1) && (scl_in == 1) && (start == 1)) begin
+                state <= READ_ADDR;
+                start <= 0;
+                sda_oe <= 0;
+            end
+            
+            // Rising edge of SCL
+            if ((scl_prev == 0) && (scl_in == 1) && (start == 1)) begin
                 case(state)
-                        
-                        READ_ADDR: begin
-                                write_enable <= 0;                        
+                    READ_ADDR: begin
+                        addr[counter] <= sda_in;
+                        if(counter == 0) begin
+                            state <= SEND_ACK;
+                        end else begin
+                            counter <= counter - 1;
                         end
-                        
-                        SEND_ACK: begin
-                                sda_out <= 0;
-                                write_enable <= 1;        
+                    end
+                    
+                    SEND_ACK: begin
+                        if(addr[7:1] == ADDRESS) begin
+                            counter <= 7;
+                            if(addr[0] == 0) begin 
+                                state <= READ_DATA;
+                            end else begin
+                                state <= WRITE_DATA;
+                            end
+                        end else begin
+                            start <= 0;
+                            state <= READ_ADDR;
                         end
-                        
-                        READ_DATA: begin
-                                write_enable <= 0;
+                    end
+                    
+                    READ_DATA: begin
+                        data_in[counter] <= sda_in;
+                        if(counter == 0) begin
+                            state <= SEND_ACK2;
+                        end else begin
+                            counter <= counter - 1;
                         end
-                        
-                        WRITE_DATA: begin
-                                sda_out <= data_in[counter];
-                                write_enable <= 1;
+                    end
+                    
+                    SEND_ACK2: begin
+                        state <= READ_ADDR;                                        
+                    end
+                    
+                    WRITE_DATA: begin
+                        if(counter == 0) begin
+                            state <= READ_ADDR;
+                        end else begin
+                            counter <= counter - 1;
                         end
-                        
-                        SEND_ACK2: begin
-                                sda_out <= 0;
-                                write_enable <= 1;
-                        end
+                    end
                 endcase
+            end
+            
+            // Falling edge of SCL - set outputs
+            if ((scl_prev == 1) && (scl_in == 0) && (start == 1)) begin
+                case(state)
+                    READ_ADDR: begin
+                        sda_oe <= 0;                        
+                    end
+                    
+                    SEND_ACK: begin
+                        if(addr[7:1] == ADDRESS) begin
+                            sda_out <= 0;
+                            sda_oe <= 1;
+                        end else begin
+                            sda_oe <= 0;
+                        end
+                    end
+                    
+                    READ_DATA: begin
+                        sda_oe <= 0;
+                    end
+                    
+                    WRITE_DATA: begin
+                        sda_out <= data_out[counter];
+                        sda_oe <= 1;
+                    end
+                    
+                    SEND_ACK2: begin
+                        sda_out <= 0;
+                        sda_oe <= 1;
+                    end
+                endcase
+            end
         end
+    end
 endmodule
